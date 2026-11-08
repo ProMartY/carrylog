@@ -1,0 +1,279 @@
+use ingot::{CAPACITY, EMPTY_ROOT, CarryLog, Journal, verify_checkpoint}
+use std::abi::{sol, DynArray}
+
+fn words<const N: usize>(_ values: [u256; N]) -> DynArray<u256> {
+    var result = MemVec<u256>::new()
+    var i: usize = 0
+    while i < N {
+        result.push(values[i])
+        i += 1
+    }
+    DynArray::from_slice(result.as_slice())
+}
+
+fn deploy(publisher: Address) -> Address uses (evm: mut Evm) {
+    evm.create2<CarryLog>(value: Wei::zero(), args: (publisher,), salt: 0)
+}
+
+fn append(addr: Address, expected_size: u256, digest: u256) -> u256
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: addr,
+        gas: 500000,
+        value: Wei::zero(),
+        message: Journal::Append { expected_size, digest },
+    )
+}
+
+fn checkpoint(addr: Address) -> (u256, u256) uses (evm: mut Evm) {
+    evm.call(
+        addr: addr,
+        gas: 300000,
+        value: Wei::zero(),
+        message: Journal::Checkpoint {},
+    )
+}
+
+fn verify_current(addr: Address, index: u256, digest: u256, siblings: DynArray<u256>) -> bool
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: addr,
+        gas: 300000,
+        value: Wei::zero(),
+        message: Journal::VerifyCurrent { index, digest, siblings },
+    )
+}
+
+#[test]
+fn stale_write_reverts_without_changing_the_checkpoint() uses (evm: mut Evm) {
+    let addr = with (evm) {
+        deploy(publisher: evm.address())
+    }
+    let original = with (evm) {
+        append(addr: addr, expected_size: 0, digest: 5)
+    }
+    let attempt = evm
+        .try_call(
+            addr: addr,
+            gas: 500000,
+            value: Wei::zero(),
+            message: Journal::Append { expected_size: 0, digest: 6 },
+        )
+    assert!(!attempt.success())
+    let data = attempt.returndata()
+    assert!(data.len() == 68)
+    assert!(
+        data.word_at(0) >> 224 == sol("StaleSize(uint256,uint256)") as u256,
+    )
+    assert!(data.word_at(4) == 0)
+    assert!(data.word_at(36) == 1)
+    let (size, root) = with (evm) {
+        checkpoint(addr: addr)
+    }
+    assert!(size == 1 && root == original)
+}
+
+#[test]
+fn another_sender_cannot_write_but_can_read() uses (evm: mut Evm) {
+    let other = Address::new(0x1234)
+    assert!(other != evm.address())
+    let addr = with (evm) {
+        deploy(publisher: other)
+    }
+    let attempt = evm
+        .try_call(
+            addr: addr,
+            gas: 500000,
+            value: Wei::zero(),
+            message: Journal::Append { expected_size: 0, digest: 5 },
+        )
+    assert!(!attempt.success())
+    let data = attempt.returndata()
+    assert!(data.len() == 4)
+    // word_at requires a full word, so inspect the selector through the four bytes.
+    let selector = (data.get(0).unwrap() as u256) << 24
+        | (data.get(1).unwrap() as u256) << 16
+        | (data.get(2).unwrap() as u256) << 8
+        | (data.get(3).unwrap() as u256)
+    assert!(selector == sol("NotPublisher()") as u256)
+    let (size, root) = with (evm) {
+        checkpoint(addr: addr)
+    }
+    assert!(size == 0 && root == EMPTY_ROOT)
+    assert!(
+        !with (evm) {
+            verify_current(addr: addr, index: 0, digest: 5, siblings: words([]))
+        },
+    )
+}
+
+#[test]
+fn singleton_proof_and_invalid_sizes() uses (evm: mut Evm) {
+    let addr = with (evm) {
+        deploy(publisher: evm.address())
+    }
+    let root = with (evm) {
+        append(addr: addr, expected_size: 0, digest: 0)
+    }
+    assert!(
+        with (evm) {
+            verify_current(addr: addr, index: 0, digest: 0, siblings: words([]))
+        },
+    )
+    assert!(
+        !verify_checkpoint(
+            size: 1,
+            root: root,
+            index: 1,
+            digest: 0,
+            siblings: words([]),
+        ),
+    )
+    assert!(
+        !verify_checkpoint(
+            size: 0,
+            root: root,
+            index: 0,
+            digest: 0,
+            siblings: words([]),
+        ),
+    )
+    assert!(
+        !verify_checkpoint(
+            size: CAPACITY + 1,
+            root: root,
+            index: 0,
+            digest: 0,
+            siblings: words([]),
+        ),
+    )
+    assert!(
+        !verify_checkpoint(
+            size: 1,
+            root: root,
+            index: 0,
+            digest: 0,
+            siblings: words([0]),
+        ),
+    )
+}
+
+#[test]
+fn append_roots_match_an_independent_tree() uses (evm: mut Evm) {
+    // Ordered prefix roots independently computed in fixtures/vectors.json.
+    let expected: [u256; 10] = [
+        0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470,
+        0xa6eef7e35abe7026729641147f7915573c7e97b47efa546f5f6e3230263bcb49,
+        0x81a63711fbe5fb6c31e594f0952773342aa8efd2ef63c3d4b13b59ad66f879cb,
+        0x06b1e786a3583aa219f3c29c993f21f77ecb2d562de28b080839ffd0b47f35f9,
+        0x7f14d4bc6906c928d98fe33313f9911664beb590e80b68809e7d8ad768d6de98,
+        0xb43c447d9a26efa019cd291fa2cdece4a20a9bdce9c9653c55b01fd5f01a93bb,
+        0xe44a5ec8eb4e3165b1f84a7809cfde00d38747d69c557b66946dc53c17120db8,
+        0xb9ab3c61a6a64a985cc4e83ace3e617233e355fffdb8733a520a79adb6c9d31c,
+        0x35f1d163b4c6c1200c3cce51b4010d9dac7dc2491dd8a6871b7096696dd089e4,
+        0x5001ebc6cade2fefdcda42a06f75e77c883d2f865a9ca5e524f0993738a1c2df,
+    ]
+    let addr = with (evm) {
+        deploy(publisher: evm.address())
+    }
+    let (empty_size, empty_root) = with (evm) {
+        checkpoint(addr: addr)
+    }
+    assert!(empty_size == 0 && empty_root == expected[0])
+    var i: usize = 0
+    while i < 9 {
+        let new_size = (i + 1) as u256
+        let updated = with (evm) {
+            append(addr: addr, expected_size: i as u256, digest: new_size)
+        }
+        let (size, root) = with (evm) {
+            checkpoint(addr: addr)
+        }
+        assert!(
+            updated == expected[i + 1] && size == new_size && root == updated,
+        )
+        i += 1
+    }
+}
+
+#[test]
+fn demo_release_receipts() uses (evm: mut Evm) {
+    // SHA-256 of the three example files, including their LF terminators.
+    let windows = 0x17aacc9953615687fe403571546597fb1addfb1166706be578c06b059a347c05
+    let linux = 0x057ffbaff9405aa0a526844ce711b2dc91bd37e54ce061e6b77705e64a2d215c
+    let macos = 0x0398989dc74c152f21e8b507f719bea0a9717e505f30c2bf2c91aff530f1a148
+    let windows_leaf = 0x89da0221a2638b5a90a9d098aae30187d8d17f2a50f9f838d2ac5e8237f36cfe
+    let macos_leaf = 0x6b049a6b580f6253a6cf0de6cc177ca97d2c0087a25daf8fa06f3bbe324dba11
+    let addr = with (evm) {
+        deploy(publisher: evm.address())
+    }
+
+    let _ = with (evm) {
+        append(addr: addr, expected_size: 0, digest: windows)
+    }
+    let earlier = with (evm) {
+        append(addr: addr, expected_size: 1, digest: linux)
+    }
+    assert!(
+        earlier == 0xf589415ad7a809240aa89ba5b9e3983fd9a71ed9a100386082a5257f8faa1d6a,
+    )
+    assert!(
+        with (evm) {
+            verify_current(
+                addr: addr,
+                index: 1,
+                digest: linux,
+                siblings: words([windows_leaf]),
+            )
+        },
+    )
+
+    let later = with (evm) {
+        append(addr: addr, expected_size: 2, digest: macos)
+    }
+    assert!(
+        later == 0xe1fe71dd6bd218c86a153dae7367791a4392ef90e022877c7da26dc115fdb942,
+    )
+    // A size-2 proof still works for its recorded root, but no longer for the live root.
+    assert!(
+        verify_checkpoint(
+            size: 2,
+            root: earlier,
+            index: 1,
+            digest: linux,
+            siblings: words([windows_leaf]),
+        ),
+    )
+    assert!(
+        !with (evm) {
+            verify_current(
+                addr: addr,
+                index: 1,
+                digest: linux,
+                siblings: words([windows_leaf]),
+            )
+        },
+    )
+    assert!(
+        with (evm) {
+            verify_current(
+                addr: addr,
+                index: 1,
+                digest: linux,
+                siblings: words([windows_leaf, macos_leaf]),
+            )
+        },
+    )
+    assert!(
+        !with (evm) {
+            verify_current(
+                addr: addr,
+                index: 1,
+                digest: linux ^ 1,
+                siblings: words([windows_leaf, macos_leaf]),
+            )
+        },
+    )
+}

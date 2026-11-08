@@ -1,0 +1,61 @@
+use ingot::{CAPACITY, CarryLog, Journal, LogFull}
+use std::evm::has_selector
+
+#[test]
+fn fills_journal_and_rejects_the_next_append() uses (evm: mut Evm) {
+    // The independent oracle in fixtures/vectors.json repeats digest 0x42.
+    let prefix_root = 0xe2f416e103d0d05e55d128bf86103c81f7929e3f0594a64f8141248d9c877199
+    let full_root = 0x5149ef9572e1d254c7cffd21136af0ab192ad4e59eca40e8b9eb23c5aec3a037
+    let digest: u256 = 0x42
+    let addr = evm.create2<CarryLog>(value: Wei::zero(), args: (evm.address(),), salt: 0)
+
+    var index: u256 = 0
+    while index < CAPACITY - 1 {
+        let _: u256 = evm
+            .call(
+                addr: addr,
+                gas: 150000,
+                value: Wei::zero(),
+                message: Journal::Append { expected_size: index, digest },
+            )
+        index += 1
+    }
+    let (prefix_size, checkpoint_root) = evm
+        .call(
+            addr: addr,
+            gas: 150000,
+            value: Wei::zero(),
+            message: Journal::Checkpoint {},
+        )
+    assert!(
+        prefix_size == CAPACITY - 1 && checkpoint_root == prefix_root,
+    )
+
+    let updated = evm
+        .call(
+            addr: addr,
+            gas: 150000,
+            value: Wei::zero(),
+            message: Journal::Append { expected_size: CAPACITY - 1, digest },
+        )
+    assert!(updated == full_root)
+
+    let attempt = evm
+        .try_call(
+            addr: addr,
+            gas: 150000,
+            value: Wei::zero(),
+            message: Journal::Append { expected_size: CAPACITY, digest },
+        )
+    assert!(
+        !attempt.success() && has_selector<LogFull>(attempt.returndata()),
+    )
+    let (size_after, root_after) = evm
+        .call(
+            addr: addr,
+            gas: 150000,
+            value: Wei::zero(),
+            message: Journal::Checkpoint {},
+        )
+    assert!(size_after == CAPACITY && root_after == full_root)
+}

@@ -1,0 +1,122 @@
+use std::abi::{sol, DynArray}
+use std::evm::revert_error
+
+pub use proof::{CAPACITY, EMPTY_ROOT, verify_checkpoint}
+use proof::{branch_hash, leaf_hash}
+
+struct Frontier { size: u256, peaks: [u256; 17] }
+
+impl Frontier {
+    fn append_digest(mut self, digest: u256) {
+        if self.size >= CAPACITY {
+            revert_error(LogFull {})
+        }
+        var peak = leaf_hash(digest: digest)
+        var occupied = self.size
+        var height: usize = 0
+        // The carry joins the old left subtree and the incoming right subtree.
+        // Consumed slots may retain stale hashes; the count is the occupancy mask.
+        while occupied & 1 == 1 {
+            peak = branch_hash(left: self.peaks[height], right: peak)
+            occupied = occupied >> 1
+            height += 1
+        }
+        self.peaks[height] = peak
+        self.size += 1
+    }
+
+    fn root(self) -> u256 {
+        if self.size == 0 {
+            return EMPTY_ROOT
+        }
+        var remaining = self.size
+        var height: usize = 0
+        var seen = false
+        var acc: u256 = 0
+        // Smaller peaks are farther right. This fold recreates the left-balanced tree.
+        while remaining != 0 {
+            if remaining & 1 == 1 {
+                let peak = self.peaks[height]
+                acc = if seen {
+                    branch_hash(left: peak, right: acc)
+                } else {
+                    peak
+                }
+                seen = true
+            }
+            remaining = remaining >> 1
+            height += 1
+        }
+        acc
+    }
+}
+
+#[event]
+pub struct Appended {
+    #[indexed]
+    pub index: u256,
+    pub digest: u256,
+    pub root: u256,
+}
+
+#[error]
+pub struct NotPublisher {}
+
+#[error]
+pub struct StaleSize { pub expected: u256, pub actual: u256 }
+
+#[error]
+pub struct LogFull {}
+
+pub msg Journal {
+    #[selector = sol("append(uint256,uint256)")]
+    Append { expected_size: u256, digest: u256 } -> u256,
+    #[selector = sol("checkpoint()")]
+    Checkpoint {} -> (u256, u256),
+    #[selector = sol("verifyCurrent(uint256,uint256,uint256[])")]
+    VerifyCurrent { index: u256, digest: u256, siblings: DynArray<u256> } -> bool,
+}
+
+pub contract CarryLog uses (ctx: Ctx, log: mut Log) {
+    publisher: Address,
+    mut frontier: Frontier,
+
+    init(publisher_address: Address)
+    uses (mut publisher)
+    {
+        assert!(publisher_address != Address::zero())
+        publisher = publisher_address
+    }
+
+    recv Journal {
+        Append { expected_size, digest } -> u256 uses (ctx, publisher, mut frontier, mut log) {
+            if ctx.caller() != publisher {
+                revert_error(NotPublisher {})
+            }
+            let index = frontier.size
+            if expected_size != index {
+                revert_error(StaleSize { expected: expected_size, actual: index })
+            }
+            frontier.append_digest(digest: digest)
+            let root = frontier.root()
+            log.emit(event: Appended { index, digest, root })
+            root
+        }
+
+        Checkpoint {} -> (u256, u256) uses (frontier) {
+            (frontier.size, frontier.root())
+        }
+
+        VerifyCurrent { index, digest, siblings } -> bool
+        uses (frontier)
+        {
+            verify_checkpoint(
+                size: frontier.size,
+                root: frontier.root(),
+                index,
+                digest,
+                siblings,
+            )
+        }
+    }
+}

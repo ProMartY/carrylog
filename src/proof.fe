@@ -1,0 +1,67 @@
+use std::abi::DynArray
+use std::evm::keccak_words
+
+pub const CAPACITY: u256 = 65_536
+pub const EMPTY_ROOT: u256 = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+
+pub fn leaf_hash(digest: u256) -> u256 {
+    keccak_words([0, digest])
+}
+
+pub fn branch_hash(left: u256, right: u256) -> u256 {
+    keccak_words([1, left, right])
+}
+
+/// Verify an index and digest against an independently authenticated (size, root).
+/// Siblings must be supplied from the leaf upwards. No direction flags are accepted.
+pub fn verify_checkpoint(
+    size: u256,
+    root: u256,
+    index: u256,
+    digest: u256,
+    siblings: DynArray<u256>,
+) -> bool {
+    if size > CAPACITY || index >= size || siblings.len() > 16 {
+        return false
+    }
+
+    // Descend through the canonical left-balanced shape. Each power of two is
+    // considered at most once; a right edge is stored as 1 for the later fold.
+    var width = size
+    var offset = index
+    var split = CAPACITY >> 1
+    var directions: u256 = 0
+    var depth: usize = 0
+    while width > 1 {
+        while split >= width {
+            split = split >> 1
+        }
+        directions = directions << 1
+        if offset < split {
+            width = split
+        } else {
+            directions |= 1
+            offset -= split
+            width -= split
+        }
+        depth += 1
+    }
+
+    if siblings.len() != depth {
+        return false
+    }
+
+    var acc = leaf_hash(digest: digest)
+    var step: usize = 0
+    while step < depth {
+        let sibling = siblings.get(step)
+        acc = if directions & 1 == 0 {
+            branch_hash(left: acc, right: sibling)
+        } else {
+            branch_hash(left: sibling, right: acc)
+        }
+        directions = directions >> 1
+        step += 1
+    }
+    acc == root
+}
